@@ -157,7 +157,6 @@ function AddModal({ onClose, onAdd }) {
           ref={fileRef}
           type="file"
           accept="image/*"
-          capture="environment"
           style={{ display: 'none' }}
           onChange={handlePhoto}
         />
