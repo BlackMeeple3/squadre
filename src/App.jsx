@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import {
   DndContext,
   DragOverlay,
@@ -36,7 +36,7 @@ function Avatar({ participant, size = 'md' }) {
   )
 }
 
-function ParticipantCard({ participant, inTeam, onDelete, showDelete }) {
+function ParticipantCard({ participant, inTeam, onDelete, onEdit, showDelete }) {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: participant.id,
   })
@@ -51,13 +51,22 @@ function ParticipantCard({ participant, inTeam, onDelete, showDelete }) {
       <Avatar participant={participant} size={inTeam ? 'sm' : 'md'} />
       <span className="participant-name">{participant.name}</span>
       {showDelete && (
-        <button
-          className="del-btn"
-          onPointerDown={e => { e.stopPropagation(); onDelete(participant.id) }}
-          aria-label="Elimina"
-        >
-          ×
-        </button>
+        <>
+          <button
+            className="del-btn edit-btn"
+            onPointerDown={e => { e.stopPropagation(); onEdit(participant) }}
+            aria-label="Modifica"
+          >
+            ✎
+          </button>
+          <button
+            className="del-btn"
+            onPointerDown={e => { e.stopPropagation(); onDelete(participant.id) }}
+            aria-label="Elimina"
+          >
+            ×
+          </button>
+        </>
       )}
     </div>
   )
@@ -74,7 +83,6 @@ function DroppablePool({ children }) {
 
 function DroppableTeam({ team, children, count }) {
   const { setNodeRef, isOver } = useDroppable({ id: team })
-  const label = team === 'a' ? 'Squadra A' : 'Squadra B'
   return (
     <div ref={setNodeRef} className={`team-col ${team} ${isOver ? 'drag-over' : ''}`}>
       <span className="team-count">{count}</span>
@@ -89,12 +97,14 @@ function DroppableTeam({ team, children, count }) {
   )
 }
 
-function AddModal({ onClose, onAdd }) {
-  const [name, setName] = useState('')
+function ParticipantModal({ existing, onClose, onSave }) {
+  const [name, setName] = useState(existing?.name || '')
   const [photoFile, setPhotoFile] = useState(null)
-  const [photoPreview, setPhotoPreview] = useState(null)
+  const [photoPreview, setPhotoPreview] = useState(existing?.photo_url || null)
   const [uploading, setUploading] = useState(false)
   const fileRef = useRef()
+
+  const isEdit = !!existing
 
   const handlePhoto = e => {
     const file = e.target.files[0]
@@ -107,7 +117,7 @@ function AddModal({ onClose, onAdd }) {
     if (!name.trim()) return
     setUploading(true)
     try {
-      let photo_url = null
+      let photo_url = existing?.photo_url || null
 
       if (photoFile) {
         const ext = photoFile.name.split('.').pop()
@@ -121,13 +131,22 @@ function AddModal({ onClose, onAdd }) {
         }
       }
 
-      const { data, error } = await supabase
-        .from('participants')
-        .insert({ name: name.trim(), photo_url, team: 'pool', position: Date.now() })
-        .select()
-        .single()
-
-      if (!error) onAdd(data)
+      if (isEdit) {
+        const { data, error } = await supabase
+          .from('participants')
+          .update({ name: name.trim(), photo_url })
+          .eq('id', existing.id)
+          .select()
+          .single()
+        if (!error) onSave(data)
+      } else {
+        const { data, error } = await supabase
+          .from('participants')
+          .insert({ name: name.trim(), photo_url, team: 'pool', position: Date.now() })
+          .select()
+          .single()
+        if (!error) onSave(data)
+      }
     } finally {
       setUploading(false)
     }
@@ -136,7 +155,7 @@ function AddModal({ onClose, onAdd }) {
   return (
     <div className="modal-overlay" onPointerDown={e => e.target === e.currentTarget && onClose()}>
       <div className="modal">
-        <h2>Nuovo partecipante</h2>
+        <h2>{isEdit ? 'Modifica' : 'Nuovo partecipante'}</h2>
 
         <div className="photo-picker" onClick={() => fileRef.current.click()}>
           {photoPreview ? (
@@ -180,7 +199,7 @@ function AddModal({ onClose, onAdd }) {
             onClick={handleSave}
             disabled={!name.trim() || uploading}
           >
-            {uploading ? 'Salvataggio…' : 'Aggiungi'}
+            {uploading ? 'Salvataggio…' : isEdit ? 'Salva' : 'Aggiungi'}
           </button>
         </div>
       </div>
@@ -192,6 +211,7 @@ export default function App() {
   const [participants, setParticipants] = useState([])
   const [loading, setLoading] = useState(true)
   const [showModal, setShowModal] = useState(false)
+  const [editingParticipant, setEditingParticipant] = useState(null)
   const [activeId, setActiveId] = useState(null)
   const [editMode, setEditMode] = useState(false)
 
@@ -229,7 +249,6 @@ export default function App() {
   const pool = participants.filter(p => p.team === 'pool')
   const teamA = participants.filter(p => p.team === 'a')
   const teamB = participants.filter(p => p.team === 'b')
-
   const activeParticipant = participants.find(p => p.id === activeId)
 
   async function moveToTeam(participantId, team) {
@@ -249,15 +268,20 @@ export default function App() {
   function handleDragEnd({ active, over }) {
     setActiveId(null)
     if (!over) return
-    const dest = over.id // 'pool' | 'a' | 'b'
+    const dest = over.id
     const participant = participants.find(p => p.id === active.id)
     if (!participant || participant.team === dest) return
     moveToTeam(active.id, dest)
   }
 
-  function handleAdd(newParticipant) {
-    setParticipants(prev => [...prev, newParticipant])
+  function handleSave(savedParticipant) {
+    setParticipants(prev => {
+      const exists = prev.find(p => p.id === savedParticipant.id)
+      if (exists) return prev.map(p => p.id === savedParticipant.id ? savedParticipant : p)
+      return [...prev, savedParticipant]
+    })
     setShowModal(false)
+    setEditingParticipant(null)
   }
 
   async function handleDelete(id) {
@@ -280,7 +304,7 @@ export default function App() {
               color: editMode ? 'white' : 'var(--text-muted)',
               fontSize: 16,
             }}
-            title={editMode ? 'Fine modifica' : 'Elimina partecipanti'}
+            title={editMode ? 'Fine modifica' : 'Modifica/elimina'}
           >
             {editMode ? '✓' : '✎'}
           </button>
@@ -291,7 +315,6 @@ export default function App() {
       </div>
 
       <DndContext sensors={sensors} onDragStart={handleDragStart} onDragEnd={handleDragEnd}>
-        {/* Pool */}
         <div className="pool-section">
           <p className="pool-title">In attesa ({pool.length})</p>
           <DroppablePool>
@@ -302,6 +325,7 @@ export default function App() {
                 inTeam={false}
                 showDelete={editMode}
                 onDelete={handleDelete}
+                onEdit={p => setEditingParticipant(p)}
               />
             ))}
             {pool.length === 0 && (
@@ -312,7 +336,6 @@ export default function App() {
           </DroppablePool>
         </div>
 
-        {/* Teams */}
         <div className="zone-labels">
           <div className="zone-badge a">⚽ Squadra A</div>
           <div className="zone-badge b">⚽ Squadra B</div>
@@ -327,6 +350,7 @@ export default function App() {
                 inTeam={true}
                 showDelete={editMode}
                 onDelete={handleDelete}
+                onEdit={p => setEditingParticipant(p)}
               />
             ))}
           </DroppableTeam>
@@ -338,6 +362,7 @@ export default function App() {
                 inTeam={true}
                 showDelete={editMode}
                 onDelete={handleDelete}
+                onEdit={p => setEditingParticipant(p)}
               />
             ))}
           </DroppableTeam>
@@ -357,7 +382,18 @@ export default function App() {
       </DndContext>
 
       {showModal && (
-        <AddModal onClose={() => setShowModal(false)} onAdd={handleAdd} />
+        <ParticipantModal
+          onClose={() => setShowModal(false)}
+          onSave={handleSave}
+        />
+      )}
+
+      {editingParticipant && (
+        <ParticipantModal
+          existing={editingParticipant}
+          onClose={() => setEditingParticipant(null)}
+          onSave={handleSave}
+        />
       )}
     </div>
   )
