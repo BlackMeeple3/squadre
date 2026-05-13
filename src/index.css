@@ -126,14 +126,11 @@ body {
 
 .pool-scroll {
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
-  overflow-x: auto;
   padding-bottom: 8px;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-  min-height: 100px;
+  min-height: 80px;
 }
-.pool-scroll::-webkit-scrollbar { display: none; }
 
 /* TEAMS GRID */
 .teams {
