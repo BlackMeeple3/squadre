@@ -9,7 +9,19 @@ import {
   useDroppable,
   useDraggable,
 } from '@dnd-kit/core'
-import { supabase } from './lib/supabase'
+import {
+  collection,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  doc,
+  onSnapshot,
+  orderBy,
+  query,
+  serverTimestamp,
+} from 'firebase/firestore'
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage'
+import { db, storage } from './lib/firebase'
 import './index.css'
 
 function initials(name) {
@@ -120,32 +132,25 @@ function ParticipantModal({ existing, onClose, onSave }) {
       let photo_url = existing?.photo_url || null
 
       if (photoFile) {
-        const ext = photoFile.name.split('.').pop()
-        const path = `${Date.now()}.${ext}`
-        const { error: upErr } = await supabase.storage
-          .from('photos')
-          .upload(path, photoFile, { upsert: true })
-        if (!upErr) {
-          const { data } = supabase.storage.from('photos').getPublicUrl(path)
-          photo_url = data.publicUrl
-        }
+        const path = `photos/${Date.now()}_${photoFile.name}`
+        const storageRef = ref(storage, path)
+        await uploadBytes(storageRef, photoFile)
+        photo_url = await getDownloadURL(storageRef)
       }
 
       if (isEdit) {
-        const { data, error } = await supabase
-          .from('participants')
-          .update({ name: name.trim(), photo_url })
-          .eq('id', existing.id)
-          .select()
-          .single()
-        if (!error) onSave(data)
+        const docRef = doc(db, 'participants', existing.id)
+        await updateDoc(docRef, { name: name.trim(), photo_url })
+        onSave({ ...existing, name: name.trim(), photo_url })
       } else {
-        const { data, error } = await supabase
-          .from('participants')
-          .insert({ name: name.trim(), photo_url, team: 'pool', position: Date.now() })
-          .select()
-          .single()
-        if (!error) onSave(data)
+        const docRef = await addDoc(collection(db, 'participants'), {
+          name: name.trim(),
+          photo_url,
+          team: 'pool',
+          position: Date.now(),
+          created_at: serverTimestamp(),
+        })
+        onSave({ id: docRef.id, name: name.trim(), photo_url, team: 'pool', position: Date.now() })
       }
     } finally {
       setUploading(false)
@@ -225,26 +230,14 @@ export default function App() {
   )
 
   useEffect(() => {
-    loadParticipants()
-
-    const channel = supabase
-      .channel('participants-changes')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'participants' }, () => {
-        loadParticipants()
-      })
-      .subscribe()
-
-    return () => supabase.removeChannel(channel)
+    const q = query(collection(db, 'participants'), orderBy('position'))
+    const unsubscribe = onSnapshot(q, snapshot => {
+      const data = snapshot.docs.map(d => ({ id: d.id, ...d.data() }))
+      setParticipants(data)
+      setLoading(false)
+    })
+    return () => unsubscribe()
   }, [])
-
-  async function loadParticipants() {
-    const { data } = await supabase
-      .from('participants')
-      .select('*')
-      .order('position')
-    if (data) setParticipants(data)
-    setLoading(false)
-  }
 
   const pool = participants.filter(p => p.team === 'pool')
   const teamA = participants.filter(p => p.team === 'a')
@@ -255,10 +248,7 @@ export default function App() {
     setParticipants(prev =>
       prev.map(p => p.id === participantId ? { ...p, team } : p)
     )
-    await supabase
-      .from('participants')
-      .update({ team })
-      .eq('id', participantId)
+    await updateDoc(doc(db, 'participants', participantId), { team })
   }
 
   function handleDragStart({ active }) {
@@ -286,7 +276,7 @@ export default function App() {
 
   async function handleDelete(id) {
     setParticipants(prev => prev.filter(p => p.id !== id))
-    await supabase.from('participants').delete().eq('id', id)
+    await deleteDoc(doc(db, 'participants', id))
   }
 
   if (loading) return <div className="loading">Caricamento…</div>
@@ -304,11 +294,10 @@ export default function App() {
               color: editMode ? 'white' : 'var(--text-muted)',
               fontSize: 16,
             }}
-            title={editMode ? 'Fine modifica' : 'Modifica/elimina'}
           >
             {editMode ? '✓' : '✎'}
           </button>
-          <button className="add-btn" onClick={() => setShowModal(true)} title="Aggiungi partecipante">
+          <button className="add-btn" onClick={() => setShowModal(true)}>
             +
           </button>
         </div>
@@ -329,9 +318,7 @@ export default function App() {
               />
             ))}
             {pool.length === 0 && (
-              <div className="empty-drop">
-                <span>Nessuno in attesa</span>
-              </div>
+              <div className="empty-drop"><span>Nessuno in attesa</span></div>
             )}
           </DroppablePool>
         </div>
@@ -368,10 +355,7 @@ export default function App() {
           </DroppableTeam>
         </div>
 
-        <DragOverlay dropAnimation={{
-          duration: 200,
-          easing: 'cubic-bezier(0.18, 0.67, 0.6, 1.22)',
-        }}>
+        <DragOverlay dropAnimation={{ duration: 200, easing: 'cubic-bezier(0.18, 0.67, 0.6, 1.22)' }}>
           {activeParticipant && (
             <div className="participant overlay">
               <Avatar participant={activeParticipant} size="md" />
@@ -382,12 +366,8 @@ export default function App() {
       </DndContext>
 
       {showModal && (
-        <ParticipantModal
-          onClose={() => setShowModal(false)}
-          onSave={handleSave}
-        />
+        <ParticipantModal onClose={() => setShowModal(false)} onSave={handleSave} />
       )}
-
       {editingParticipant && (
         <ParticipantModal
           existing={editingParticipant}
