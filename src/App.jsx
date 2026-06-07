@@ -20,17 +20,36 @@ import {
   query,
   serverTimestamp,
 } from 'firebase/firestore'
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage'
-import { db, storage } from './lib/firebase'
+import { db } from './lib/firebase'
 import './index.css'
 
+// Ridimensiona e comprime la foto a max 400x400px, restituisce base64
+function resizeImage(file, maxSize = 400, quality = 0.75) {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    const url = URL.createObjectURL(file)
+    img.onload = () => {
+      URL.revokeObjectURL(url)
+      let { width, height } = img
+      if (width > height) {
+        if (width > maxSize) { height = Math.round(height * maxSize / width); width = maxSize }
+      } else {
+        if (height > maxSize) { width = Math.round(width * maxSize / height); height = maxSize }
+      }
+      const canvas = document.createElement('canvas')
+      canvas.width = width
+      canvas.height = height
+      const ctx = canvas.getContext('2d')
+      ctx.drawImage(img, 0, 0, width, height)
+      resolve(canvas.toDataURL('image/jpeg', quality))
+    }
+    img.onerror = reject
+    img.src = url
+  })
+}
+
 function initials(name) {
-  return name
-    .split(' ')
-    .map(w => w[0])
-    .slice(0, 2)
-    .join('')
-    .toUpperCase()
+  return name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase()
 }
 
 function Avatar({ participant, size = 'md' }) {
@@ -49,9 +68,7 @@ function Avatar({ participant, size = 'md' }) {
 }
 
 function ParticipantCard({ participant, inTeam, onDelete, onEdit, showDelete }) {
-  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
-    id: participant.id,
-  })
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({ id: participant.id })
 
   return (
     <div
@@ -68,16 +85,12 @@ function ParticipantCard({ participant, inTeam, onDelete, onEdit, showDelete }) 
             className="del-btn edit-btn"
             onPointerDown={e => { e.stopPropagation(); onEdit(participant) }}
             aria-label="Modifica"
-          >
-            ✎
-          </button>
+          >✎</button>
           <button
             className="del-btn"
             onPointerDown={e => { e.stopPropagation(); onDelete(participant.id) }}
             aria-label="Elimina"
-          >
-            ×
-          </button>
+          >×</button>
         </>
       )}
     </div>
@@ -99,11 +112,9 @@ function DroppableTeam({ team, children, count }) {
     <div ref={setNodeRef} className={`team-col ${team} ${isOver ? 'drag-over' : ''}`}>
       <span className="team-count">{count}</span>
       <div className="team-members">
-        {children.length === 0 ? (
-          <div className="empty-drop">
-            <span>Trascina qui</span>
-          </div>
-        ) : children}
+        {children.length === 0
+          ? <div className="empty-drop"><span>Trascina qui</span></div>
+          : children}
       </div>
     </div>
   )
@@ -111,32 +122,30 @@ function DroppableTeam({ team, children, count }) {
 
 function ParticipantModal({ existing, onClose, onSave }) {
   const [name, setName] = useState(existing?.name || '')
-  const [photoFile, setPhotoFile] = useState(null)
   const [photoPreview, setPhotoPreview] = useState(existing?.photo_url || null)
+  const [photoBase64, setPhotoBase64] = useState(null)
   const [uploading, setUploading] = useState(false)
   const fileRef = useRef()
-
   const isEdit = !!existing
 
-  const handlePhoto = e => {
+  const handlePhoto = async e => {
     const file = e.target.files[0]
     if (!file) return
-    setPhotoFile(file)
-    setPhotoPreview(URL.createObjectURL(file))
+    setUploading(true)
+    try {
+      const base64 = await resizeImage(file)
+      setPhotoBase64(base64)
+      setPhotoPreview(base64)
+    } finally {
+      setUploading(false)
+    }
   }
 
   const handleSave = async () => {
     if (!name.trim()) return
     setUploading(true)
     try {
-      let photo_url = existing?.photo_url || null
-
-      if (photoFile) {
-        const path = `photos/${Date.now()}_${photoFile.name}`
-        const storageRef = ref(storage, path)
-        await uploadBytes(storageRef, photoFile)
-        photo_url = await getDownloadURL(storageRef)
-      }
+      const photo_url = photoBase64 || existing?.photo_url || null
 
       if (isEdit) {
         const docRef = doc(db, 'participants', existing.id)
@@ -172,9 +181,7 @@ function ParticipantModal({ existing, onClose, onSave }) {
             </>
           )}
           {uploading && (
-            <div className="uploading-indicator">
-              <div className="spinner" />
-            </div>
+            <div className="uploading-indicator"><div className="spinner" /></div>
           )}
         </div>
         <input
@@ -221,12 +228,8 @@ export default function App() {
   const [editMode, setEditMode] = useState(false)
 
   const sensors = useSensors(
-    useSensor(PointerSensor, {
-      activationConstraint: { distance: 8 },
-    }),
-    useSensor(TouchSensor, {
-      activationConstraint: { delay: 120, tolerance: 8 },
-    })
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 120, tolerance: 8 } })
   )
 
   useEffect(() => {
@@ -245,15 +248,11 @@ export default function App() {
   const activeParticipant = participants.find(p => p.id === activeId)
 
   async function moveToTeam(participantId, team) {
-    setParticipants(prev =>
-      prev.map(p => p.id === participantId ? { ...p, team } : p)
-    )
+    setParticipants(prev => prev.map(p => p.id === participantId ? { ...p, team } : p))
     await updateDoc(doc(db, 'participants', participantId), { team })
   }
 
-  function handleDragStart({ active }) {
-    setActiveId(active.id)
-  }
+  function handleDragStart({ active }) { setActiveId(active.id) }
 
   function handleDragEnd({ active, over }) {
     setActiveId(null)
@@ -294,12 +293,8 @@ export default function App() {
               color: editMode ? 'white' : 'var(--text-muted)',
               fontSize: 16,
             }}
-          >
-            {editMode ? '✓' : '✎'}
-          </button>
-          <button className="add-btn" onClick={() => setShowModal(true)}>
-            +
-          </button>
+          >{editMode ? '✓' : '✎'}</button>
+          <button className="add-btn" onClick={() => setShowModal(true)}>+</button>
         </div>
       </div>
 
@@ -309,17 +304,12 @@ export default function App() {
           <DroppablePool>
             {pool.map(p => (
               <ParticipantCard
-                key={p.id}
-                participant={p}
-                inTeam={false}
-                showDelete={editMode}
-                onDelete={handleDelete}
+                key={p.id} participant={p} inTeam={false}
+                showDelete={editMode} onDelete={handleDelete}
                 onEdit={p => setEditingParticipant(p)}
               />
             ))}
-            {pool.length === 0 && (
-              <div className="empty-drop"><span>Nessuno in attesa</span></div>
-            )}
+            {pool.length === 0 && <div className="empty-drop"><span>Nessuno in attesa</span></div>}
           </DroppablePool>
         </div>
 
@@ -332,11 +322,8 @@ export default function App() {
           <DroppableTeam team="a" count={teamA.length}>
             {teamA.map(p => (
               <ParticipantCard
-                key={p.id}
-                participant={p}
-                inTeam={true}
-                showDelete={editMode}
-                onDelete={handleDelete}
+                key={p.id} participant={p} inTeam={true}
+                showDelete={editMode} onDelete={handleDelete}
                 onEdit={p => setEditingParticipant(p)}
               />
             ))}
@@ -344,11 +331,8 @@ export default function App() {
           <DroppableTeam team="b" count={teamB.length}>
             {teamB.map(p => (
               <ParticipantCard
-                key={p.id}
-                participant={p}
-                inTeam={true}
-                showDelete={editMode}
-                onDelete={handleDelete}
+                key={p.id} participant={p} inTeam={true}
+                showDelete={editMode} onDelete={handleDelete}
                 onEdit={p => setEditingParticipant(p)}
               />
             ))}
@@ -365,9 +349,7 @@ export default function App() {
         </DragOverlay>
       </DndContext>
 
-      {showModal && (
-        <ParticipantModal onClose={() => setShowModal(false)} onSave={handleSave} />
-      )}
+      {showModal && <ParticipantModal onClose={() => setShowModal(false)} onSave={handleSave} />}
       {editingParticipant && (
         <ParticipantModal
           existing={editingParticipant}
