@@ -643,3 +643,22 @@ body { -webkit-font-smoothing: antialiased; }
   font-size: 14px;
   padding: 40px 0;
 }
+
+/* DRAW BUTTON */
+.draw-btn {
+  width: 100%;
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text-muted);
+  font-family: 'Syne', sans-serif;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  letter-spacing: 0.5px;
+}
+.draw-btn:active { background: var(--surface); color: var(--text); }
+
+.match-winner-label.draw { color: var(--text-muted); }
