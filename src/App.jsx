@@ -192,9 +192,11 @@ function ParticipantModal({ existing, onClose, onSave }) {
 }
 
 // ── Win Confirm Modal ──────────────────────────────────
-function WinModal({ team, members, onClose, onConfirm }) {
+function WinModal({ team, teamA, teamB, onClose, onConfirm }) {
   const [date, setDate] = useState(todayISO())
   const [saving, setSaving] = useState(false)
+  const isDraw = team === 'draw'
+  const members = isDraw ? [...teamA, ...teamB] : (team === 'a' ? teamA : teamB)
 
   const handle = async () => {
     setSaving(true)
@@ -205,8 +207,8 @@ function WinModal({ team, members, onClose, onConfirm }) {
   return (
     <div className="modal-overlay" onPointerDown={e => e.target === e.currentTarget && onClose()}>
       <div className="modal">
-        <h2>🏆 Squadra {team.toUpperCase()} vince!</h2>
-        <p>Conferma la vittoria — ogni giocatore riceve un punto.</p>
+        <h2>{isDraw ? '🤝 Pareggio!' : `🏆 Squadra ${team.toUpperCase()} vince!`}</h2>
+        <p>{isDraw ? 'Tutti prendono +1 presenza, nessuna vittoria.' : 'Ogni giocatore della squadra vincente riceve un punto.'}</p>
 
         <div className="win-team-preview">
           {members.map(p => (
@@ -225,10 +227,10 @@ function WinModal({ team, members, onClose, onConfirm }) {
         <div className="modal-actions">
           <button className="btn-cancel" onClick={onClose}>Annulla</button>
           <button
-            className={`btn-save ${team === 'a' ? 'btn-win-a' : 'btn-win-b'}`}
+            className={`btn-save ${isDraw ? '' : team === 'a' ? 'btn-win-a' : 'btn-win-b'}`}
             onClick={handle} disabled={saving}
           >
-            {saving ? 'Salvataggio…' : 'Conferma vittoria'}
+            {saving ? 'Salvataggio…' : isDraw ? 'Conferma pareggio' : 'Conferma vittoria'}
           </button>
         </div>
       </div>
@@ -314,15 +316,14 @@ function StatsPage({ participants, matches }) {
         <div className="match-list">
           {matches.length === 0 && <div className="empty-stats">Nessuna partita ancora 🎮</div>}
           {[...matches].sort((a, b) => new Date(b.date) - new Date(a.date)).map(m => {
-            const winners = m.winnerIds.map(id => participants.find(p => p.id === id)).filter(Boolean)
             return (
               <div key={m.id} className="match-card">
                 <div className="match-date">{formatDate(m.date)}</div>
-                <div className={`match-winner-label ${m.winnerTeam}`}>
-                  Squadra {m.winnerTeam.toUpperCase()} 🏆
+                <div className={`match-winner-label ${m.isDraw ? 'draw' : m.winnerTeam}`}>
+                  {m.isDraw ? '🤝 Pareggio' : `Squadra ${m.winnerTeam.toUpperCase()} 🏆`}
                 </div>
                 <div className="match-faces">
-                  {winners.map(p => (
+                  {(m.isDraw ? m.allIds || [] : m.winnerIds || []).map(id => participants.find(p => p.id === id)).filter(Boolean).map(p => (
                     <div key={p.id} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3 }}>
                       <Avatar participant={p} size={36} />
                       <span style={{ fontSize: 10, color: 'var(--text-muted)', maxWidth: 40, textAlign: 'center', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
@@ -411,18 +412,20 @@ export default function App() {
   }
 
   async function handleWinConfirm(team, members, date) {
+    const isDraw = team === 'draw'
+    const allPlayers = [...teamA, ...teamB]
     // Save match
     await addDoc(collection(db, 'matches'), {
       winnerTeam: team,
-      winnerIds: members.map(p => p.id),
-      allIds: [...teamA, ...teamB].map(p => p.id),
+      winnerIds: isDraw ? [] : members.map(p => p.id),
+      allIds: allPlayers.map(p => p.id),
       date,
+      isDraw,
       created_at: serverTimestamp(),
     })
-    // Update stats for winners (+1 win, +1 match)
-    const allPlayers = [...teamA, ...teamB]
+    // Update stats: draw = +1 presence only; win = +1 win +1 presence for winners, +1 presence for losers
     for (const p of allPlayers) {
-      const isWinner = members.some(m => m.id === p.id)
+      const isWinner = !isDraw && members.some(m => m.id === p.id)
       await updateDoc(doc(db, 'participants', p.id), {
         wins: (p.wins || 0) + (isWinner ? 1 : 0),
         matches: (p.matches || 0) + 1,
@@ -494,6 +497,13 @@ export default function App() {
               showActions={editMode} onHide={handleHide} onEdit={setEditingP}
               onWin={t => setWinTeam(t)} />
           </div>
+          {(teamA.length > 0 || teamB.length > 0) && (
+            <div style={{ padding: '0 20px 16px' }}>
+              <button className="draw-btn" onClick={() => setWinTeam('draw')}>
+                🤝 Pareggio
+              </button>
+            </div>
+          )}
 
           <DragOverlay dropAnimation={{ duration: 200, easing: 'cubic-bezier(0.18, 0.67, 0.6, 1.22)' }}>
             {activeParticipant && (
@@ -526,7 +536,8 @@ export default function App() {
       {winTeam && (
         <WinModal
           team={winTeam}
-          members={winTeam === 'a' ? teamA : teamB}
+          teamA={teamA}
+          teamB={teamB}
           onClose={() => setWinTeam(null)}
           onConfirm={handleWinConfirm}
         />
