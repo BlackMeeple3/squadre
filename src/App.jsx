@@ -270,23 +270,28 @@ function computeStats(participants, matches) {
 
   const stats = {}
   participants.forEach(p => {
-    stats[p.id] = { id: p.id, wins: 0, losses: 0, draws: 0, played: 0, streak: 0, best: 0, series: [0] }
+    stats[p.id] = { id: p.id, wins: 0, losses: 0, draws: 0, played: 0, streak: 0, best: 0, series: [0], results: [], first: null, last: null }
   })
 
   ordered.forEach(m => {
     Object.values(stats).forEach(s => {
       if (m.all.includes(s.id)) {
         s.played++
+        if (!s.first) s.first = m.date
+        s.last = m.date
         if (m.kind === 'draw') {
           s.draws++
           s.streak = 0
+          s.results.push('D')
         } else if (m.winners.includes(s.id)) {
           s.wins++
           s.streak++
           s.best = Math.max(s.best, s.streak)
+          s.results.push('W')
         } else {
           s.losses++
           s.streak = 0
+          s.results.push('L')
         }
       }
       s.series.push(s.wins)
@@ -296,8 +301,10 @@ function computeStats(participants, matches) {
   return { ordered, stats }
 }
 
+// La % vittorie ha senso solo con un minimo di partite: sotto la soglia vale null (non contata)
+const MIN_PCT_GAMES = 3
 function winPct(s) {
-  return s.played ? s.wins / s.played : 0
+  return s.played >= MIN_PCT_GAMES ? s.wins / s.played : null
 }
 
 function headToHead(ordered, a, b) {
@@ -358,10 +365,55 @@ function computeNemesis(ordered, participants) {
   return result
 }
 
+// Compagni e avversari di un singolo giocatore.
+// Nemesi e vittima: chi ti ha battuto / chi hai battuto più volte da avversario (a parità, più scontri).
+// Miglior compagno: % di vittorie in squadra insieme, contata solo da MIN_PCT_GAMES partite insieme.
+function computeRelations(ordered, pid) {
+  const rel = {}
+  const get = id => {
+    if (!rel[id]) rel[id] = { id, tn: 0, tw: 0, td: 0, tl: 0, an: 0, aw: 0, ad: 0, al: 0 }
+    return rel[id]
+  }
+  ordered.forEach(m => {
+    if (!m.split || !m.all.includes(pid)) return
+    const first = m.split[0]
+    const mySide = first.includes(pid) ? 0 : 1
+    m.all.forEach(oid => {
+      if (oid === pid) return
+      const r = get(oid)
+      const otherSide = first.includes(oid) ? 0 : 1
+      if (otherSide === mySide) {
+        r.tn++
+        if (m.kind === 'draw') r.td++
+        else if (mySide === 0) r.tw++
+        else r.tl++
+      } else {
+        r.an++
+        if (m.kind === 'draw') r.ad++
+        else if (mySide === 0) r.aw++
+        else r.al++
+      }
+    })
+  })
+
+  const list = Object.values(rel)
+  const pickMax = (rows, key) => rows.reduce((best, r) => (
+    !best || r[key] > best[key] || (r[key] === best[key] && r.an > best.an) ? r : best
+  ), null)
+  const nemesis = pickMax(list.filter(r => r.al > 0), 'al')
+  const victim = pickMax(list.filter(r => r.aw > 0), 'aw')
+  const mate = list
+    .filter(r => r.tn >= MIN_PCT_GAMES)
+    .reduce((best, r) => (
+      !best || r.tw / r.tn > best.tw / best.tn || (r.tw / r.tn === best.tw / best.tn && r.tn > best.tn) ? r : best
+    ), null)
+  return { nemesis, victim, mate }
+}
+
 const METRICS = [
   { key: 'wins', label: 'Vittorie', val: s => s.wins, fmt: v => v, unit: 'V' },
   { key: 'played', label: 'Presenze', val: s => s.played, fmt: v => v, unit: 'P' },
-  { key: 'pct', label: '% vittorie', val: s => winPct(s), fmt: v => `${Math.round(v * 100)}%`, unit: '' },
+  { key: 'pct', label: '% vittorie', val: s => winPct(s) ?? -1, fmt: v => (v < 0 ? '—' : `${Math.round(v * 100)}%`), unit: '' },
   { key: 'streak', label: 'Striscia', val: s => s.streak, fmt: v => v, unit: '🔥' },
   { key: 'best', label: 'Record striscia', val: s => s.best, fmt: v => v, unit: '🔥' },
   { key: 'draws', label: 'Pareggi', val: s => s.draws, fmt: v => v, unit: '' },
@@ -594,7 +646,93 @@ function HeadToHead({ players, ordered }) {
   )
 }
 
-function NemesisList({ players, stats, ordered, cmpWins }) {
+const FORM_LABEL = { W: 'V', D: 'P', L: 'S' }
+const FORM_TITLE = { W: 'Vittoria', D: 'Pareggio', L: 'Sconfitta' }
+
+function RelRow({ title, other, text, empty }) {
+  return (
+    <div className="rel-row">
+      {other ? <Avatar participant={other} size={36} /> : <div className="rel-ph" />}
+      <div className="lb-main">
+        <span className="rel-title">{title}</span>
+        <span className="lb-name">{other ? other.name : '—'}</span>
+        <span className="lb-sub">{other ? text : empty}</span>
+      </div>
+    </div>
+  )
+}
+
+function PlayerSheet({ player, s, rankPos, ordered, byId, onClose }) {
+  const rel = useMemo(() => computeRelations(ordered, player.id), [ordered, player.id])
+  const pct = winPct(s)
+  const form = s.results.slice(-5)
+
+  useEffect(() => {
+    const onKey = e => e.key === 'Escape' && onClose()
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const times = n => `${n} ${n === 1 ? 'volta' : 'volte'}`
+  const nem = rel.nemesis, vic = rel.victim, mate = rel.mate
+
+  return (
+    <div className="modal-overlay" onPointerDown={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal sheet" role="dialog" aria-label={`Statistiche di ${player.name}`}>
+        <div className="sheet-head">
+          <Avatar participant={player} size={72} />
+          <div className="sheet-title">
+            <h2>{player.name}</h2>
+            <span>{rankPos}° per vittorie · {s.played} {s.played === 1 ? 'partita' : 'partite'}</span>
+          </div>
+          <button className="sheet-close" onClick={onClose} aria-label="Chiudi">×</button>
+        </div>
+
+        <div className="sheet-grid">
+          <div className="sheet-tile"><strong>{s.wins}</strong><span>vinte</span></div>
+          <div className="sheet-tile"><strong>{s.draws}</strong><span>pari</span></div>
+          <div className="sheet-tile"><strong>{s.losses}</strong><span>perse</span></div>
+          <div className="sheet-tile">
+            <strong>{pct === null ? '—' : `${Math.round(pct * 100)}%`}</strong>
+            <span>{pct === null ? `servono ${MIN_PCT_GAMES} partite` : 'vittorie'}</span>
+          </div>
+          <div className="sheet-tile"><strong>{s.streak}</strong><span>striscia 🔥</span></div>
+          <div className="sheet-tile"><strong>{s.best}</strong><span>record 🔥</span></div>
+        </div>
+
+        <div className="sheet-label">Ultime partite{form.length > 0 ? ' (la più recente a destra)' : ''}</div>
+        <div className="form-row">
+          {form.map((r, i) => (
+            <span key={i} className={`form-dot ${r}`} title={FORM_TITLE[r]} aria-label={FORM_TITLE[r]}>{FORM_LABEL[r]}</span>
+          ))}
+        </div>
+
+        <div className="sheet-label">Con gli altri</div>
+        <RelRow
+          title="Miglior compagno" other={mate && byId[mate.id]}
+          text={mate ? `${mate.tw} vinte su ${mate.tn} insieme` : ''}
+          empty={`Servono ${MIN_PCT_GAMES} partite in squadra con lo stesso giocatore`}
+        />
+        <RelRow
+          title="Nemesi" other={nem && byId[nem.id]}
+          text={nem ? `Ha perso contro di lui ${times(nem.al)} su ${nem.an}` : ''}
+          empty="Nessuna: non ha mai perso da avversario"
+        />
+        <RelRow
+          title="Vittima preferita" other={vic && byId[vic.id]}
+          text={vic ? `L'ha battuto ${times(vic.aw)} su ${vic.an}` : ''}
+          empty="Nessuno battuto da avversario finora"
+        />
+
+        {s.first && (
+          <p className="chart-note">In campo dal {formatDate(s.first)} · ultima partita {formatDate(s.last)}</p>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function NemesisList({ players, stats, ordered, cmpWins, tap }) {
   const nem = useMemo(() => computeNemesis(ordered, players), [ordered, players])
   const byId = Object.fromEntries(players.map(p => [p.id, p]))
   const rows = [...players].sort((a, b) => ((nem[b.id]?.lost || 0) - (nem[a.id]?.lost || 0)) || cmpWins(a, b))
@@ -606,7 +744,7 @@ function NemesisList({ players, stats, ordered, cmpWins }) {
         const n = nem[p.id]
         const q = n ? byId[n.id] : null
         return (
-          <div key={p.id} className="lb-row">
+          <div key={p.id} className="lb-row tappable" {...tap(p.id)}>
             <Avatar participant={p} size={36} />
             <div className="lb-main">
               <span className="lb-name">{p.name}</span>
@@ -631,14 +769,23 @@ function NemesisList({ players, stats, ordered, cmpWins }) {
 function StatsPage({ participants, matches }) {
   const [tab, setTab] = useState('rank')
   const [metric, setMetric] = useState('wins')
+  const [openId, setOpenId] = useState(null)
 
   const { ordered, stats } = useMemo(() => computeStats(participants, matches), [participants, matches])
   const players = useMemo(() => participants.filter(p => stats[p.id]?.played > 0), [participants, stats])
+  const byId = useMemo(() => Object.fromEntries(participants.map(p => [p.id, p])), [participants])
 
   const cmpWins = (a, b) => {
     const sa = stats[a.id], sb = stats[b.id]
-    return (sb.wins - sa.wins) || (winPct(sb) - winPct(sa)) || (sb.played - sa.played)
+    return (sb.wins - sa.wins) || ((winPct(sb) ?? -1) - (winPct(sa) ?? -1)) || (sb.played - sa.played)
   }
+
+  const tap = id => ({
+    role: 'button',
+    tabIndex: 0,
+    onClick: () => setOpenId(id),
+    onKeyDown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpenId(id) } },
+  })
 
   if (matches.length === 0) {
     return <div className="stats-page"><div className="empty-stats">Nessuna partita ancora 🎮</div></div>
@@ -666,7 +813,7 @@ function StatsPage({ participants, matches }) {
       {top3.length > 0 && (
         <div className="podium">
           {podiumOrder.map((p, i) => p ? (
-            <div key={p.id} className={`podium-place ${podiumClass[i]}`}>
+            <div key={p.id} className={`podium-place tappable ${podiumClass[i]}`} {...tap(p.id)}>
               <div className="podium-avatar-wrap">
                 <span className="podium-crown">{podiumCrown[i]}</span>
                 <Avatar participant={p} size={i === 1 ? 64 : 52} />
@@ -699,8 +846,8 @@ function StatsPage({ participants, matches }) {
               const s = stats[p.id]
               const v = m.val(s)
               return (
-                <div key={p.id} className="lb-row">
-                  <span className={`lb-rank ${i === 0 ? 'r1' : i === 1 ? 'r2' : i === 2 ? 'r3' : ''}`}>{i + 1}</span>
+                <div key={p.id} className="lb-row tappable" {...tap(p.id)}>
+                  <span className={`lb-rank ${v < 0 ? '' : i === 0 ? 'r1' : i === 1 ? 'r2' : i === 2 ? 'r3' : ''}`}>{v < 0 ? '–' : i + 1}</span>
                   <Avatar participant={p} size={36} />
                   <div className="lb-main">
                     <span className="lb-name">{p.name}</span>
@@ -714,6 +861,9 @@ function StatsPage({ participants, matches }) {
               )
             })}
           </div>
+          {metric === 'pct' && (
+            <p className="chart-note">La % vittorie si calcola da {MIN_PCT_GAMES} partite giocate: prima di allora compare «—» e il giocatore resta in fondo.</p>
+          )}
           {(metric === 'streak' || metric === 'best') && (
             <p className="chart-note">Una striscia conta le vittorie di fila nelle partite giocate. Un pareggio o una sconfitta la interrompono.</p>
           )}
@@ -722,7 +872,7 @@ function StatsPage({ participants, matches }) {
 
       {tab === 'chart' && <ProgressChart players={players} stats={stats} ordered={ordered} cmpWins={cmpWins} />}
       {tab === 'h2h' && <HeadToHead players={players} ordered={ordered} />}
-      {tab === 'nemesis' && <NemesisList players={players} stats={stats} ordered={ordered} cmpWins={cmpWins} />}
+      {tab === 'nemesis' && <NemesisList players={players} stats={stats} ordered={ordered} cmpWins={cmpWins} tap={tap} />}
 
       {tab === 'history' && (
         <div className="match-list">
@@ -749,6 +899,17 @@ function StatsPage({ participants, matches }) {
             )
           })}
         </div>
+      )}
+
+      {openId && stats[openId] && (
+        <PlayerSheet
+          player={byId[openId]}
+          s={stats[openId]}
+          rankPos={[...players].sort(cmpWins).findIndex(x => x.id === openId) + 1}
+          ordered={ordered}
+          byId={byId}
+          onClose={() => setOpenId(null)}
+        />
       )}
     </div>
   )
