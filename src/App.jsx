@@ -6,10 +6,11 @@ import {
   useDroppable, useDraggable,
 } from '@dnd-kit/core'
 import {
-  collection, addDoc, updateDoc, deleteDoc,
+  collection, addDoc, updateDoc, deleteDoc, setDoc, writeBatch,
   doc, onSnapshot, orderBy, query, serverTimestamp,
 } from 'firebase/firestore'
-import { db } from './lib/firebase'
+import { onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth'
+import { db, auth, googleProvider, ADMIN_EMAIL } from './lib/firebase'
 import './index.css'
 
 // ── Utils ──────────────────────────────────────────────
@@ -40,12 +41,14 @@ function resizeImage(file, maxSize = 400, quality = 0.75) {
 }
 
 function formatDate(iso) {
-  const d = new Date(iso)
+  const d = new Date(iso + 'T12:00:00')
   return d.toLocaleDateString('it-IT', { day: '2-digit', month: 'short', year: 'numeric' })
 }
 
+// Data di oggi nel fuso del telefono (toISOString userebbe UTC e dopo mezzanotte darebbe il giorno prima)
 function todayISO() {
-  return new Date().toISOString().split('T')[0]
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
 
 // ── Avatar ─────────────────────────────────────────────
@@ -192,16 +195,26 @@ function ParticipantModal({ existing, onClose, onSave }) {
 }
 
 // ── Win Confirm Modal ──────────────────────────────────
-function WinModal({ team, teamA, teamB, onClose, onConfirm }) {
+function WinModal({ team, teamA, teamB, matches, onClose, onConfirm }) {
   const [date, setDate] = useState(todayISO())
   const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
   const isDraw = team === 'draw'
   const members = isDraw ? [...teamA, ...teamB] : (team === 'a' ? teamA : teamB)
+  const existing = date ? matches.find(m => m.date === date) : null
 
   const handle = async () => {
     setSaving(true)
-    await onConfirm(team, members, date)
-    setSaving(false)
+    setError('')
+    try {
+      await onConfirm(team, members, date)
+    } catch (e) {
+      setError(e.message === 'duplicate'
+        ? 'Per questo giorno c’è già un risultato.'
+        : 'Salvataggio non riuscito, riprova.')
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -224,11 +237,19 @@ function WinModal({ team, teamA, teamB, onClose, onConfirm }) {
           <input className="date-input" type="date" value={date} onChange={e => setDate(e.target.value)} />
         </div>
 
+        {existing && (
+          <p className="warn-note">
+            Il {formatDate(date)} c’è già {existing.isDraw ? 'un pareggio' : `una vittoria (squadra ${existing.winnerTeam.toUpperCase()})`}.
+            Si registra un solo risultato al giorno: scegli un’altra data oppure fallo correggere all’admin dallo Storico.
+          </p>
+        )}
+        {error && <p className="warn-note">{error}</p>}
+
         <div className="modal-actions">
           <button className="btn-cancel" onClick={onClose}>Annulla</button>
           <button
             className={`btn-save ${isDraw ? '' : team === 'a' ? 'btn-win-a' : 'btn-win-b'}`}
-            onClick={handle} disabled={saving}
+            onClick={handle} disabled={saving || !date || !!existing}
           >
             {saving ? 'Salvataggio…' : isDraw ? 'Conferma pareggio' : 'Conferma vittoria'}
           </button>
@@ -243,7 +264,7 @@ function WinModal({ team, teamA, teamB, onClose, onConfirm }) {
 const SERIES = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767']
 
 function shortDate(iso) {
-  return new Date(iso).toLocaleDateString('it-IT', { day: 'numeric', month: 'short' })
+  return new Date(iso + 'T12:00:00').toLocaleDateString('it-IT', { day: 'numeric', month: 'short' })
 }
 
 function matchKey(m) {
@@ -408,6 +429,74 @@ function computeRelations(ordered, pid) {
       !best || r.tw / r.tn > best.tw / best.tn || (r.tw / r.tn === best.tw / best.tn && r.tn > best.tn) ? r : best
     ), null)
   return { nemesis, victim, mate }
+}
+
+// ── Stagioni, correzione risultati, squadre (logica pura) ─
+// Stagione dal 1° settembre al 31 agosto, etichetta "2026/27"
+const SEASON_START_MONTH = 9
+function seasonOf(iso) {
+  const y = +iso.slice(0, 4)
+  const mo = +iso.slice(5, 7)
+  const start = mo >= SEASON_START_MONTH ? y : y - 1
+  return `${start}/${String(start + 1).slice(2)}`
+}
+
+// Campi aggiunti da normalizeMatch: non vanno mai riscritti su Firestore
+function stripNormalized(m) {
+  const { id, kind, all, winners, losers, split, ...raw } = m
+  return raw
+}
+
+// [squadra A, squadra B] di una partita, oppure null se non si sa come erano divise
+function matchSides(m) {
+  if (m.kind === 'win') {
+    return m.winnerTeam === 'a' ? [m.winners, m.losers] : [m.losers, m.winners]
+  }
+  return m.teamA && m.teamB ? [m.teamA, m.teamB] : null
+}
+
+// Campi da salvare per portare la partita a 'a' | 'b' | 'draw'. null se non si può (pareggio senza squadre → vittoria)
+function resultFields(m, result) {
+  const sides = matchSides(m)
+  if (!sides) return result === 'draw' ? { winnerTeam: 'draw', isDraw: true, winnerIds: [] } : null
+  const [A, B] = sides
+  return {
+    winnerTeam: result,
+    isDraw: result === 'draw',
+    winnerIds: result === 'a' ? A : result === 'b' ? B : [],
+    teamA: A,
+    teamB: B,
+  }
+}
+
+// Precompilazione: i più presenti (stagione corrente se ha almeno 3 partite, altrimenti tutto lo storico),
+// a parità presenze di sempre, poi vittorie. "Fissi" = presenti ad almeno il 60% delle partite.
+const REGULAR_RATE = 0.6
+function buildLineup(candidates, matches, season) {
+  const inSeason = matches.filter(m => seasonOf(m.date) === season)
+  const base = inSeason.length >= 3 ? inSeason : matches
+  const { stats } = computeStats(candidates, base)
+  const all = computeStats(candidates, matches).stats
+  const ranked = [...candidates].sort((a, b) =>
+    (stats[b.id].played - stats[a.id].played) ||
+    (all[b.id].played - all[a.id].played) ||
+    (stats[b.id].wins - stats[a.id].wins) ||
+    a.name.localeCompare(b.name))
+  const days = base.length
+  const regulars = days ? ranked.filter(p => stats[p.id].played / days >= REGULAR_RATE).length : ranked.length
+  const defaultCount = Math.min(ranked.length, Math.max(4, regulars))
+  return { ranked, stats, days, defaultCount }
+}
+
+// Divide in due squadre bilanciate (a "serpentina" sulla % vittorie): con numero dispari
+// la squadra più debole ha un giocatore in più. Sotto le 3 partite la % non conta: forza neutra.
+function splitBalanced(selected, stats) {
+  const strength = p => winPct(stats[p.id]) ?? 0.5
+  const order = [...selected].sort((a, b) =>
+    (strength(b) - strength(a)) || (stats[b.id].wins - stats[a.id].wins) || a.name.localeCompare(b.name))
+  const A = [], B = []
+  order.forEach((p, i) => ((i % 4 === 0 || i % 4 === 3) ? A : B).push(p))
+  return { A, B }
 }
 
 const METRICS = [
@@ -765,11 +854,187 @@ function NemesisList({ players, stats, ordered, cmpWins, tap }) {
   )
 }
 
+// ── Modifica partita (solo admin) ──────────────────────
+const RESULT_LABEL = { a: 'Squadra A', draw: 'Pareggio', b: 'Squadra B' }
+
+function MatchEditModal({ match, matches, onClose }) {
+  const current = match.kind === 'draw' ? 'draw' : match.winnerTeam
+  const sides = matchSides(match)
+  const [result, setResult] = useState(current)
+  const [date, setDate] = useState(match.date)
+  const [saving, setSaving] = useState(false)
+  const [confirmDel, setConfirmDel] = useState(false)
+  const [error, setError] = useState('')
+  const other = date ? matches.find(x => x.id !== match.id && x.date === date) : null
+  const unchanged = result === current && date === match.date
+
+  const fail = e => setError(e && e.code === 'permission-denied'
+    ? 'Permesso negato: controlla di aver fatto l’accesso con l’account admin e che le regole di Firestore siano aggiornate.'
+    : 'Operazione non riuscita, riprova.')
+
+  async function save() {
+    const fields = resultFields(match, result)
+    if (!fields || !date) return
+    setSaving(true)
+    setError('')
+    try {
+      if (date === match.date) {
+        await updateDoc(doc(db, 'matches', match.id), fields)
+      } else {
+        // la partita è identificata dalla data: cambiare giorno = nuovo documento + eliminazione del vecchio
+        const batch = writeBatch(db)
+        batch.set(doc(db, 'matches', date), { ...stripNormalized(match), ...fields, date })
+        batch.delete(doc(db, 'matches', match.id))
+        await batch.commit()
+      }
+      onClose()
+    } catch (e) {
+      fail(e)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function remove() {
+    setSaving(true)
+    setError('')
+    try {
+      await deleteDoc(doc(db, 'matches', match.id))
+      onClose()
+    } catch (e) {
+      fail(e)
+      setConfirmDel(false)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onPointerDown={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <h2>Modifica partita</h2>
+
+        <div className="field">
+          <label>Risultato</label>
+          <div className="seg">
+            {['a', 'draw', 'b'].map(r => (
+              <button
+                key={r}
+                className={`seg-btn ${r} ${result === r ? 'on' : ''}`}
+                disabled={!sides && r !== current}
+                onClick={() => setResult(r)}
+              >{RESULT_LABEL[r]}</button>
+            ))}
+          </div>
+        </div>
+        {!sides && (
+          <p className="warn-note">Di questo pareggio non erano state salvate le squadre: non si può trasformare in vittoria.</p>
+        )}
+
+        <div className="date-row">
+          <label>Data</label>
+          <input className="date-input" type="date" value={date} onChange={e => setDate(e.target.value)} />
+        </div>
+        {other && <p className="warn-note">Il {formatDate(date)} c’è già un altro risultato: una sola partita al giorno.</p>}
+        {error && <p className="warn-note">{error}</p>}
+
+        <div className="modal-actions">
+          <button className={`btn-del ${confirmDel ? 'sure' : ''}`} disabled={saving}
+            onClick={() => (confirmDel ? remove() : setConfirmDel(true))}>
+            {confirmDel ? 'Sicuro?' : 'Elimina'}
+          </button>
+          <button className="btn-cancel" onClick={onClose}>Annulla</button>
+          <button className="btn-save" onClick={save} disabled={saving || unchanged || !!other || !date}>
+            {saving ? '…' : 'Salva'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Precompila squadre ─────────────────────────────────
+function LineupSheet({ lineup, season, onApply, onClose }) {
+  const { ranked, stats, days, defaultCount } = lineup
+  const [n, setN] = useState(defaultCount)
+  const { A, B } = useMemo(() => splitBalanced(ranked.slice(0, n), stats), [n, ranked, stats])
+  const rest = ranked.slice(n)
+
+  const col = (team, list) => (
+    <div className={`lineup-col ${team}`}>
+      <div className="lineup-head">Squadra {team.toUpperCase()} <b>{list.length}</b></div>
+      {list.map(p => (
+        <div key={p.id} className="lineup-row">
+          <Avatar participant={p} size={30} />
+          <span className="lineup-name">{p.name.split(' ')[0]}</span>
+          {days > 0 && <span className="lineup-pres">{stats[p.id].played}/{days}</span>}
+        </div>
+      ))}
+    </div>
+  )
+
+  return (
+    <div className="modal-overlay" onPointerDown={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal sheet" role="dialog" aria-label="Precompila squadre">
+        <h2>✨ Precompila squadre</h2>
+        <p>
+          {days > 0
+            ? `Metto i più presenti (stagione ${season}, ${days} ${days === 1 ? 'partita' : 'partite'}) e li divido in modo bilanciato. Gli altri restano in attesa.`
+            : 'Ancora nessuna partita registrata: divido tutti i presenti. Gli altri restano in attesa.'}
+        </p>
+
+        <div className="stepper">
+          <button onClick={() => setN(v => Math.max(2, v - 1))} disabled={n <= 2} aria-label="Meno giocatori">−</button>
+          <div><strong>{n}</strong><span>giocatori in squadra</span></div>
+          <button onClick={() => setN(v => Math.min(ranked.length, v + 1))} disabled={n >= ranked.length} aria-label="Più giocatori">+</button>
+        </div>
+
+        <div className="lineup-grid">
+          {col('a', A)}
+          {col('b', B)}
+        </div>
+
+        {rest.length > 0 && (
+          <p className="lineup-rest">In attesa: {rest.map(p => p.name.split(' ')[0]).join(', ')}</p>
+        )}
+
+        <div className="modal-actions">
+          <button className="btn-cancel" onClick={onClose}>Annulla</button>
+          <button className="btn-save" onClick={() => onApply(A, B)}>Applica</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Accesso admin ──────────────────────────────────────
+function AccountButton({ user, isAdmin, onSignIn, onSignOut }) {
+  if (!user) return <button className="acct-btn" onClick={onSignIn}>🔒 Accedi</button>
+  return (
+    <button className={`acct-btn ${isAdmin ? 'ok' : 'warn'}`} onClick={onSignOut}>
+      {isAdmin ? '✓ Admin · Esci' : 'Non autorizzato · Esci'}
+    </button>
+  )
+}
+
 // ── Stats Page ─────────────────────────────────────────
-function StatsPage({ participants, matches }) {
+function StatsPage({ participants, matches: allMatches, isAdmin }) {
+  const currentSeason = useMemo(() => seasonOf(todayISO()), [])
+  const [season, setSeason] = useState(currentSeason) // 'YYYY/YY' oppure 'all'
   const [tab, setTab] = useState('rank')
   const [metric, setMetric] = useState('wins')
   const [openId, setOpenId] = useState(null)
+  const [editing, setEditing] = useState(null)
+
+  const seasons = useMemo(() => {
+    const set = new Set(allMatches.map(m => seasonOf(m.date)))
+    set.add(currentSeason)
+    return [...set].sort().reverse()
+  }, [allMatches, currentSeason])
+  const matches = useMemo(
+    () => (season === 'all' ? allMatches : allMatches.filter(m => seasonOf(m.date) === season)),
+    [allMatches, season]
+  )
 
   const { ordered, stats } = useMemo(() => computeStats(participants, matches), [participants, matches])
   const players = useMemo(() => participants.filter(p => stats[p.id]?.played > 0), [participants, stats])
@@ -787,8 +1052,26 @@ function StatsPage({ participants, matches }) {
     onKeyDown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpenId(id) } },
   })
 
+  const seasonBar = (
+    <div className="season-row">
+      {seasons.map(sn => (
+        <button key={sn} className={`chip ${season === sn ? 'on' : ''}`} onClick={() => setSeason(sn)}>
+          {sn}{sn === currentSeason ? ' · in corso' : ''}
+        </button>
+      ))}
+      <button className={`chip ${season === 'all' ? 'on' : ''}`} onClick={() => setSeason('all')}>Sempre</button>
+    </div>
+  )
+
   if (matches.length === 0) {
-    return <div className="stats-page"><div className="empty-stats">Nessuna partita ancora 🎮</div></div>
+    return (
+      <div className="stats-page">
+        {seasonBar}
+        <div className="empty-stats">
+          {season === 'all' ? 'Nessuna partita ancora 🎮' : `Nessuna partita nella stagione ${season} 🎮`}
+        </div>
+      </div>
+    )
   }
 
   const top3 = [...players].sort(cmpWins).filter(p => stats[p.id].wins > 0).slice(0, 3)
@@ -810,6 +1093,7 @@ function StatsPage({ participants, matches }) {
 
   return (
     <div className="stats-page">
+      {seasonBar}
       {top3.length > 0 && (
         <div className="podium">
           {podiumOrder.map((p, i) => p ? (
@@ -881,6 +1165,7 @@ function StatsPage({ participants, matches }) {
             const faces = ids.map(id => participants.find(p => p.id === id)).filter(Boolean)
             return (
               <div key={mt.id} className="match-card">
+                {isAdmin && <button className="match-edit" onClick={() => setEditing(mt)}>✎ Modifica</button>}
                 <div className="match-date">{formatDate(mt.date)}</div>
                 <div className={`match-winner-label ${mt.kind === 'draw' ? 'draw' : mt.winnerTeam}`}>
                   {mt.kind === 'draw' ? '🤝 Pareggio' : `Squadra ${mt.winnerTeam.toUpperCase()} 🏆`}
@@ -900,6 +1185,8 @@ function StatsPage({ participants, matches }) {
           })}
         </div>
       )}
+
+      {editing && <MatchEditModal match={editing} matches={allMatches} onClose={() => setEditing(null)} />}
 
       {openId && stats[openId] && (
         <PlayerSheet
@@ -927,6 +1214,10 @@ export default function App() {
   const [activeId, setActiveId] = useState(null)
   const [editMode, setEditMode] = useState(false)
   const [showHidden, setShowHidden] = useState(false)
+  const [user, setUser] = useState(null)
+  const [authMsg, setAuthMsg] = useState('')
+  const [showLineup, setShowLineup] = useState(false)
+  const [toast, setToast] = useState(null) // { label, prev: { id: team } }
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
@@ -945,12 +1236,76 @@ export default function App() {
     return () => { unP(); unM() }
   }, [])
 
+  useEffect(() => onAuthStateChanged(auth, u => setUser(u)), [])
+
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => setToast(null), 7000)
+    return () => clearTimeout(t)
+  }, [toast])
+
+  const isAdmin = !!user && !!ADMIN_EMAIL && user.emailVerified && (user.email || '').toLowerCase() === ADMIN_EMAIL
+
   const visible = participants.filter(p => !p.hidden)
   const hidden = participants.filter(p => p.hidden)
   const pool = visible.filter(p => p.team === 'pool')
   const teamA = visible.filter(p => p.team === 'a')
   const teamB = visible.filter(p => p.team === 'b')
   const activeParticipant = participants.find(p => p.id === activeId)
+  const lineup = useMemo(() => buildLineup(visible, matches, seasonOf(todayISO())), [participants, matches])
+
+  async function signIn() {
+    setAuthMsg('')
+    try {
+      await signInWithPopup(auth, googleProvider)
+    } catch (e) {
+      const msg = {
+        'auth/popup-blocked': 'Il browser ha bloccato la finestra di accesso: consentila e riprova.',
+        'auth/unauthorized-domain': 'Dominio non autorizzato: aggiungilo in Firebase › Authentication › Impostazioni › Domini autorizzati.',
+        'auth/operation-not-allowed': 'Accesso con Google non attivo: abilitalo in Firebase › Authentication › Metodo di accesso.',
+      }[e.code]
+      if (msg) setAuthMsg(msg)
+      else if (e.code !== 'auth/popup-closed-by-user' && e.code !== 'auth/cancelled-popup-request') setAuthMsg('Accesso non riuscito, riprova.')
+    }
+  }
+
+  // Sposta più giocatori in un colpo solo; si può annullare dal messaggio in basso
+  function commitLayout(next, label) {
+    const changed = visible.filter(p => p.team !== next[p.id])
+    if (!changed.length) return
+    const prev = {}
+    changed.forEach(p => { prev[p.id] = p.team })
+    setParticipants(list => list.map(p => (p.id in next ? { ...p, team: next[p.id] } : p)))
+    const batch = writeBatch(db)
+    changed.forEach(p => batch.update(doc(db, 'participants', p.id), { team: next[p.id] }))
+    batch.commit().catch(() => {})
+    setToast({ label, prev })
+  }
+
+  function applyLineup(A, B) {
+    const next = {}
+    visible.forEach(p => { next[p.id] = 'pool' })
+    A.forEach(p => { next[p.id] = 'a' })
+    B.forEach(p => { next[p.id] = 'b' })
+    commitLayout(next, 'Squadre precompilate')
+    setShowLineup(false)
+  }
+
+  function clearTeams() {
+    const next = {}
+    visible.forEach(p => { next[p.id] = 'pool' })
+    commitLayout(next, 'Giocatori rimessi fuori dalle squadre')
+  }
+
+  function undoLayout() {
+    if (!toast) return
+    const { prev } = toast
+    setParticipants(list => list.map(p => (p.id in prev ? { ...p, team: prev[p.id] } : p)))
+    const batch = writeBatch(db)
+    Object.entries(prev).forEach(([id, team]) => batch.update(doc(db, 'participants', id), { team }))
+    batch.commit().catch(() => {})
+    setToast(null)
+  }
 
   async function moveToTeam(id, team) {
     setParticipants(prev => prev.map(p => p.id === id ? { ...p, team } : p))
@@ -988,24 +1343,22 @@ export default function App() {
   async function handleWinConfirm(team, members, date) {
     const isDraw = team === 'draw'
     const allPlayers = [...teamA, ...teamB]
-    // Save match
-    await addDoc(collection(db, 'matches'), {
-      winnerTeam: team,
-      winnerIds: isDraw ? [] : members.map(p => p.id),
-      allIds: allPlayers.map(p => p.id),
-      teamA: teamA.map(p => p.id),
-      teamB: teamB.map(p => p.id),
-      date,
-      isDraw,
-      created_at: serverTimestamp(),
-    })
-    // Update stats: draw = +1 presence only; win = +1 win +1 presence for winners, +1 presence for losers
-    for (const p of allPlayers) {
-      const isWinner = !isDraw && members.some(m => m.id === p.id)
-      await updateDoc(doc(db, 'participants', p.id), {
-        wins: (p.wins || 0) + (isWinner ? 1 : 0),
-        matches: (p.matches || 0) + 1,
+    if (matches.some(m => m.date === date)) throw new Error('duplicate')
+    // L'ID del documento è la data: due salvataggi nello stesso giorno finiscono sullo stesso documento
+    // e le regole di Firestore rifiutano il secondo (solo l'admin può modificare)
+    try {
+      await setDoc(doc(db, 'matches', date), {
+        winnerTeam: team,
+        winnerIds: isDraw ? [] : members.map(p => p.id),
+        allIds: allPlayers.map(p => p.id),
+        teamA: teamA.map(p => p.id),
+        teamB: teamB.map(p => p.id),
+        date,
+        isDraw,
+        created_at: serverTimestamp(),
       })
+    } catch (e) {
+      throw new Error(e.code === 'permission-denied' ? 'duplicate' : 'save')
     }
     setWinTeam(null)
   }
@@ -1025,7 +1378,13 @@ export default function App() {
             <button className="add-btn primary" onClick={() => setShowModal(true)}>+</button>
           </div>
         )}
+        {page === 'stats' && (
+          <div className="header-actions">
+            <AccountButton user={user} isAdmin={isAdmin} onSignIn={signIn} onSignOut={() => signOut(auth)} />
+          </div>
+        )}
       </div>
+      {page === 'stats' && authMsg && <p className="auth-note" onClick={() => setAuthMsg('')}>{authMsg}</p>}
 
       {page === 'home' && (
         <DndContext sensors={sensors} onDragStart={handleDragStart} onDragEnd={handleDragEnd}>
@@ -1061,6 +1420,10 @@ export default function App() {
           )}
 
           {/* Teams */}
+          <div className="team-tools">
+            <button className="tool-btn" onClick={() => setShowLineup(true)} disabled={visible.length < 2}>✨ Precompila</button>
+            <button className="tool-btn" onClick={clearTeams} disabled={teamA.length + teamB.length === 0}>↺ Svuota squadre</button>
+          </div>
           <div className="zone-labels">
             <div className="zone-badge a">⚽ Squadra A</div>
             <div className="zone-badge b">⚽ Squadra B</div>
@@ -1093,7 +1456,7 @@ export default function App() {
       )}
 
       {page === 'stats' && (
-        <StatsPage participants={participants} matches={matches} />
+        <StatsPage participants={participants} matches={matches} isAdmin={isAdmin} />
       )}
 
       {/* Bottom nav */}
@@ -1109,11 +1472,21 @@ export default function App() {
       {/* Modals */}
       {showModal && <ParticipantModal onClose={() => setShowModal(false)} onSave={handleSave} />}
       {editingP && <ParticipantModal existing={editingP} onClose={() => setEditingP(null)} onSave={handleSave} />}
+      {showLineup && (
+        <LineupSheet lineup={lineup} season={seasonOf(todayISO())} onApply={applyLineup} onClose={() => setShowLineup(false)} />
+      )}
+      {toast && (
+        <div className="toast" role="status">
+          <span>{toast.label}</span>
+          <button onClick={undoLayout}>Annulla</button>
+        </div>
+      )}
       {winTeam && (
         <WinModal
           team={winTeam}
           teamA={teamA}
           teamB={teamB}
+          matches={matches}
           onClose={() => setWinTeam(null)}
           onConfirm={handleWinConfirm}
         />
